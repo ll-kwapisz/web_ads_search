@@ -1,0 +1,111 @@
+import numpy as np
+import pandas as pd
+import os
+import itertools
+from datetime import timedelta, datetime
+import time
+import requests
+import uuid
+
+from googleapiclient.discovery import build
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from time import sleep
+from google.colab import drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+### BIG QUERY
+
+dest_auth_key = '/content/drive/MyDrive/Google Keys/python_bq.json'
+dest_project = "expondo-282114"
+dataset_id='fx_nbp'
+table_name='rates_eur_base_archive'
+
+def connect_biqquery(auth_key, project):
+
+    credentials = service_account.Credentials.from_service_account_file(
+        auth_key, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+
+    # Connect to BigQuery
+    client = bigquery.Client(project = project, credentials = credentials)
+
+    return client
+
+dest_client = connect_biqquery(dest_auth_key, dest_project)
+
+  # Currency list
+
+currencies = ["GBP","USD","HUF","EUR","BGN","PLN","SEK","DKK","CZK","RON","NOK"]
+table = "A"
+
+rows = []
+
+for code in currencies:
+    try:
+        # pobranie ostatniego notowania waluty
+        url = f"https://api.nbp.pl/api/exchangerates/rates/{table}/{code}/last/1/?format=json"
+        resp = requests.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        rate_info = data["rates"][0]
+
+        # pobranie ostatniego kursu EUR do przeliczeń
+        if code != "EUR":
+            eur_resp = requests.get(f"https://api.nbp.pl/api/exchangerates/rates/{table}/EUR/last/1/?format=json")
+            eur_resp.raise_for_status()
+            eur_rate = eur_resp.json()["rates"][0]["mid"]
+            rate = rate_info["mid"] / eur_rate
+        else:
+            rate = 1.0
+
+        rows.append({
+            "id": str(uuid.uuid4()),
+            "currency": code,
+            "date": rate_info["effectiveDate"],
+            "exchange_rate": rate,
+            "sync_at": datetime.utcnow()
+        })
+    except requests.exceptions.HTTPError as e:
+        print(f"Błąd pobierania kursu {code}: {e}")
+    except Exception as e:
+        print(f"Inny błąd dla {code}: {e}")
+
+df = pd.DataFrame(rows)
+df.head()
+
+
+  # GCP Auth
+
+from google.colab import auth
+auth.authenticate_user()
+
+from google.cloud import bigquery
+client = bigquery.Client(project="PROJECT_ID")
+table_id = "PROJECT_ID.fx_nbp.rates_eur_base"
+
+# data types conversion
+
+df['currency'] = df['currency'].astype(str)
+df['date'] = pd.to_datetime(df['date']).dt.date
+df['exchange_rate'] = df['exchange_rate'].astype(float)
+df['sync_at'] = pd.to_datetime(df['sync_at'])
+
+# Explicitly define the schema for the id column as BYTES
+job_config = bigquery.LoadJobConfig(
+    schema=[
+        bigquery.SchemaField("currency", "STRING"),
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("exchange_rate", "FLOAT"),
+        bigquery.SchemaField("sync_at", "TIMESTAMP"),
+    ]
+)
+
+
+job = client.load_table_from_dataframe(df, table_id)
+job.result()
+print(f"Inserted {job.output_rows} rows {table_id}")
+
+  
