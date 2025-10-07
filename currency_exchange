@@ -20,7 +20,7 @@ drive.mount('/content/drive')
 ### BIG QUERY
 
 dest_auth_key = '/content/drive/MyDrive/Google Keys/python_bq.json'
-dest_project = "expondo-282114"
+dest_project = "PROJECT"
 dataset_id='fx_nbp'
 table_name='rates_eur_base_archive'
 
