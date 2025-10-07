@@ -1,0 +1,190 @@
+import numpy as np
+import pandas as pd
+import os
+import itertools
+from datetime import timedelta, datetime
+import time
+import requests
+import uuid
+import logging
+from datetime import datetime, timezone
+
+from googleapiclient.discovery import build
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from time import sleep
+from google.colab import drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+### BIG QUERY
+
+dest_auth_key = '/content/drive/MyDrive/Google Keys/python_bq.json'
+dest_project = "expondo-282114"
+dataset_id='seeders'
+table_name='exchange_rates_v2'
+
+def connect_biqquery(auth_key, project):
+
+    credentials = service_account.Credentials.from_service_account_file(
+        auth_key, scopes=["https://www.googleapis.com/auth/cloud-platform"])
+
+    # Connect to BigQuery
+    client = bigquery.Client(project = project, credentials = credentials)
+
+    return client
+
+dest_client = connect_biqquery(dest_auth_key, dest_project)
+
+currencies = ["GBP","USD","HUF","EUR","BGN","PLN","SEK","DKK","CZK","RON","NOK"]
+table = "A"
+
+start_date = "2025-07-01"
+end_date = "2025-09-30"
+
+run_date = datetime.now(timezone.utc).date()
+
+# Pobierz wszystkie notowania historyczne NBP w zakresie dat
+url = f"https://api.nbp.pl/api/exchangerates/tables/{table}/{start_date}/{end_date}/?format=json"
+resp = requests.get(url)
+resp.raise_for_status()
+tables = resp.json()
+
+rows = []
+
+eur_rates_map = {}
+
+for t in tables:
+    effective_date = datetime.strptime(t["effectiveDate"], "%Y-%m-%d").date()
+    eur_rate = next((r["mid"] for r in t["rates"] if r["code"] == "EUR"), None)
+    if eur_rate is None:
+        logging.warning(f"No EUR rate for date {effective_date}, skipping")
+        continue
+    eur_rates_map[effective_date] = eur_rate
+
+    for r in t["rates"]:
+        if r["code"] in currencies and r["code"] != "PLN":  # PLN dodamy ręcznie
+            exchange_rate = r["mid"] / eur_rate if r["code"] != "EUR" else 1.0
+            rows.append({
+                "id": str(uuid.uuid4()),
+                "currency": r["code"],
+                "date": effective_date,
+                "nbp_effective_date": effective_date,
+                "exchange_rate": exchange_rate,
+                "sync_at": datetime.now(timezone.utc),
+            })
+
+all_dates = pd.date_range(start=start_date, end=end_date, freq="D").date
+existing_dates = {(row["currency"], row["date"]) for row in rows}
+
+# Fallback pobierania last/1 dla brakujących dat (oprócz PLN i EUR)
+for currency in currencies:
+    if currency in ["EUR", "PLN"]:
+        continue
+    for single_date in all_dates:
+        if (currency, single_date) not in existing_dates:
+            try:
+                url = f"https://api.nbp.pl/api/exchangerates/rates/{table}/{currency}/last/1/?format=json"
+                resp = requests.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                rate_info = data["rates"][0]
+
+                if "eur_last1" not in locals():
+                    eur_resp = requests.get(f"https://api.nbp.pl/api/exchangerates/rates/{table}/EUR/last/1/?format=json")
+                    eur_resp.raise_for_status()
+                    eur_last1 = eur_resp.json()["rates"][0]["mid"]
+
+                exchange_rate = rate_info["mid"] / eur_last1 if currency != "EUR" else 1.0
+                rows.append({
+                    "id": str(uuid.uuid4()),
+                    "currency": currency,
+                    "date": single_date,
+                    "nbp_effective_date": datetime.strptime(rate_info["effectiveDate"], "%Y-%m-%d").date(),
+                    "exchange_rate": exchange_rate,
+                    "sync_at": datetime.now(timezone.utc),
+                })
+                existing_dates.add((currency, single_date))
+            except Exception as e:
+                logging.error(f"Error fetching last rate for {currency} on {single_date}: {e}")
+
+# Dodajemy ręcznie EUR z kursem 1.0 na każdy dzień
+for single_date in all_dates:
+    rows.append({
+        "id": str(uuid.uuid4()),
+        "currency": "EUR",
+        "date": single_date,
+        "nbp_effective_date": single_date,
+        "exchange_rate": 1.0,
+        "sync_at": datetime.now(timezone.utc),
+    })
+
+# Dodajemy ręcznie PLN jako odwrotność kursu EUR względem PLN
+for single_date in all_dates:
+    possible_dates = [d for d in eur_rates_map.keys() if d <= single_date]
+    if possible_dates:
+        nearest_date = max(possible_dates)
+        eur_rate_for_day = eur_rates_map[nearest_date]
+    else:
+        eur_rate_for_day = None
+        logging.warning(f"No EUR rate available for PLN on {single_date}")
+
+    exchange_rate = 1.0 / eur_rate_for_day if eur_rate_for_day is not None else None
+
+    rows.append({
+        "id": str(uuid.uuid4()),
+        "currency": "PLN",
+        "date": single_date,
+        "nbp_effective_date": single_date,
+        "exchange_rate": exchange_rate,
+        "sync_at": datetime.now(timezone.utc),
+    })
+
+df = pd.DataFrame(rows)
+
+dfs = []
+for currency in currencies:
+    curr_df = df[df["currency"] == currency].set_index("date").sort_index()
+    curr_df = curr_df[~curr_df.index.duplicated(keep='first')]  # Usuń duplikaty indeksu
+    curr_df = curr_df.reindex(all_dates)
+    curr_df["currency"] = currency
+    curr_df = curr_df.ffill().bfill()
+    dfs.append(curr_df)
+
+final_df = pd.concat(dfs).reset_index().rename(columns={"index": "date"})
+
+final_df["id"] = final_df["id"].astype(str)
+final_df["currency"] = final_df["currency"].astype(str)
+final_df["date"] = pd.to_datetime(final_df["date"]).dt.date
+final_df["nbp_effective_date"] = pd.to_datetime(final_df["nbp_effective_date"]).dt.date
+final_df["exchange_rate"] = final_df["exchange_rate"].astype(float)
+final_df["sync_at"] = pd.to_datetime(final_df["sync_at"])
+
+# final_df gotowy do ładowania do BigQuery lub dalszej analizy
+
+# Auth
+from google.colab import auth
+auth.authenticate_user()
+
+from google.cloud import bigquery
+client = bigquery.Client(project="expondo-282114")
+table_id = "expondo-282114.seeders.exchange_rates_v2"
+
+# Pełny schemat
+job_config = bigquery.LoadJobConfig(
+    schema=[
+        bigquery.SchemaField("id", "STRING"),
+        bigquery.SchemaField("currency", "STRING"),
+        bigquery.SchemaField("date", "DATE"),
+        bigquery.SchemaField("nbp_effective_date", "DATE"),
+        bigquery.SchemaField("exchange_rate", "FLOAT"),
+        bigquery.SchemaField("sync_at", "TIMESTAMP"),
+    ]
+)
+
+# Załaduj dane
+job = client.load_table_from_dataframe(final_df, table_id, job_config=job_config)
+job.result()
+print(f"Inserted {job.output_rows} rows to {table_id}")
